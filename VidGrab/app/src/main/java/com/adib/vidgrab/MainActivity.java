@@ -3,7 +3,6 @@ package com.adib.vidgrab;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -13,7 +12,6 @@ import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
@@ -22,15 +20,9 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
-import android.webkit.CookieManager;
-import android.webkit.JavascriptInterface;
 import android.webkit.URLUtil;
 import android.webkit.WebChromeClient;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebResourceResponse;
-import android.webkit.WebSettings;
 import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -39,66 +31,55 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import org.json.JSONArray;
-
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
-    static final String[] VIDEO_EXT = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".3gp", ".flv", ".avi"};
     static final String HOME = "https://www.google.com";
-
-    /** Script yang disuntikkan berkala: cari <video>/<source> dan link langsung ke file video. */
-    static final String SCAN_JS =
-            "(function(){try{var o=[];" +
-            "document.querySelectorAll('video,source').forEach(function(e){" +
-            "[e.currentSrc,e.src,e.getAttribute('data-src')].forEach(function(s){" +
-            "if(s){try{o.push('V|'+new URL(s,location.href).href);}catch(x){}}});});" +
-            "document.querySelectorAll('a[href]').forEach(function(a){" +
-            "if(/\\.(mp4|webm|mkv|mov|m4v|3gp|m3u8)(\\?|#|$)/i.test(a.href))o.push('A|'+a.href);});" +
-            "if(o.length&&window.VidGrab)VidGrab.report(JSON.stringify(o));" +
-            "}catch(x){}})();";
-
-    static class VideoItem {
-        final String url;
-        final String type;
-        final String referer;
-        String name;
-
-        VideoItem(String url, String type, String referer) {
-            this.url = url;
-            this.type = type;
-            this.referer = referer;
-        }
-    }
+    static final int MAX_PAGES = 30;
 
     private WebView web;
     private EditText urlBar;
-    private Button grabBtn;
+    private Button allBtn;
+    private Button listBtn;
     private TextView status;
     private ProgressBar progress;
     private LinearLayout mainUi;
+    private FrameLayout content;
     private FrameLayout fullscreen;
     private View customView;
     private WebChromeClient.CustomViewCallback customCb;
 
+    /** Video yang terdeteksi di halaman saat ini. */
     private final LinkedHashMap<String, VideoItem> found = new LinkedHashMap<>();
+    /** Link ke halaman yang berisi video (mis. daftar file di file hosting). */
+    private final LinkedHashSet<String> pages = new LinkedHashSet<>();
+    /** Yang sudah pernah diunduh, supaya tekan lagi tidak dobel. */
+    private final HashSet<String> doneKeys = new HashSet<>();
+    private final HashSet<String> donePages = new HashSet<>();
+
     private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private volatile String pageUrl = "";
     private volatile String pageTitle = "";
     private String userAgent;
-    private VideoItem pendingDownload;
+    private boolean toastShown;
+    private DeepScanner scanner;
+    private Runnable afterPermission;
 
-    private final Runnable scanner = new Runnable() {
+    private final Runnable scanLoop = new Runnable() {
         @Override
         public void run() {
             scanNow();
@@ -108,6 +89,23 @@ public class MainActivity extends Activity {
 
     private final Runnable hideStatus = () -> status.setVisibility(View.GONE);
 
+    private final WebSetup.Sink mainSink = new WebSetup.Sink() {
+        @Override
+        public void onVideo(String url, String type, String referer) {
+            ui.post(() -> addFound(new VideoItem(url, type, referer)));
+        }
+
+        @Override
+        public void onPage(String url) {
+            ui.post(() -> addPage(url));
+        }
+
+        @Override
+        public String currentPage() {
+            return pageUrl;
+        }
+    };
+
     // ------------------------------------------------------------------ lifecycle
 
     @Override
@@ -115,12 +113,9 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         buildUi();
         setupWebView();
-
-        if (Build.VERSION.SDK_INT < 29
-                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+        if (needsStoragePermission()) {
             requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
         }
-
         String fromIntent = extractUrl(getIntent());
         loadUrl(fromIntent != null ? fromIntent : HOME);
     }
@@ -136,20 +131,22 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         web.onResume();
-        ui.removeCallbacks(scanner);
-        ui.postDelayed(scanner, 3000);
+        ui.removeCallbacks(scanLoop);
+        ui.postDelayed(scanLoop, 2000);
     }
 
     @Override
     protected void onPause() {
-        ui.removeCallbacks(scanner);
+        ui.removeCallbacks(scanLoop);
         web.onPause();
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        if (scanner != null) scanner.cancel();
         ui.removeCallbacksAndMessages(null);
+        worker.shutdown(); // unduhan yang sedang jalan dibiarkan selesai
         web.destroy();
         super.onDestroy();
     }
@@ -169,12 +166,17 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-        if (pendingDownload != null) {
-            VideoItem it = pendingDownload;
-            pendingDownload = null;
-            if (ok) startDownload(it);
-            else toast("Izin penyimpanan ditolak, tidak bisa menyimpan video.");
+        Runnable r = afterPermission;
+        afterPermission = null;
+        if (r != null) {
+            if (ok) r.run();
+            else toast("Izin penyimpanan ditolak, video tidak bisa disimpan.");
         }
+    }
+
+    private boolean needsStoragePermission() {
+        return Build.VERSION.SDK_INT < 29
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED;
     }
 
     // ------------------------------------------------------------------ UI
@@ -192,6 +194,7 @@ public class MainActivity extends Activity {
         mainUi.setOrientation(LinearLayout.VERTICAL);
         mainUi.setBackgroundColor(0xFF121212);
 
+        // Bar alamat
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
@@ -229,30 +232,43 @@ public class MainActivity extends Activity {
         status.setTextSize(13);
         status.setPadding(dp(10), dp(6), dp(10), dp(6));
         status.setVisibility(View.GONE);
+        status.setOnClickListener(v -> status.setVisibility(View.GONE));
 
-        FrameLayout content = new FrameLayout(this);
+        content = new FrameLayout(this);
         web = new WebView(this);
         content.addView(web, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-        grabBtn = new Button(this);
-        grabBtn.setTextColor(Color.WHITE);
-        grabBtn.setTextSize(16);
-        grabBtn.setBackgroundColor(0xFF616161);
-        grabBtn.setPadding(dp(18), dp(10), dp(18), dp(10));
-        grabBtn.setOnClickListener(v -> showFoundList());
-        grabBtn.setOnLongClickListener(v -> {
-            scanNow();
-            toast("Memindai ulang halaman...");
-            return true;
-        });
-        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.END);
-        blp.setMargins(dp(16), dp(16), dp(16), dp(24));
-        content.addView(grabBtn, blp);
+        // Bar bawah: tombol besar UNDUH SEMUA + tombol daftar
+        LinearLayout bottom = new LinearLayout(this);
+        bottom.setOrientation(LinearLayout.HORIZONTAL);
+        bottom.setPadding(dp(6), dp(6), dp(6), dp(6));
+        bottom.setBackgroundColor(0xFF1E1E1E);
+
+        allBtn = new Button(this);
+        allBtn.setTextColor(Color.WHITE);
+        allBtn.setTextSize(15);
+        allBtn.setAllCaps(false);
+        allBtn.setPadding(dp(10), dp(12), dp(10), dp(12));
+        allBtn.setOnClickListener(v -> downloadAll(false));
+
+        listBtn = new Button(this);
+        listBtn.setTextColor(Color.WHITE);
+        listBtn.setTextSize(14);
+        listBtn.setAllCaps(false);
+        listBtn.setBackgroundColor(0xFF424242);
+        listBtn.setPadding(dp(12), dp(12), dp(12), dp(12));
+        listBtn.setOnClickListener(v -> showFoundList());
+
+        LinearLayout.LayoutParams lpAll = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        lpAll.setMarginEnd(dp(6));
+        bottom.addView(allBtn, lpAll);
+        bottom.addView(listBtn, new LinearLayout.LayoutParams(WRAP, WRAP));
 
         mainUi.addView(bar, new LinearLayout.LayoutParams(MATCH, WRAP));
         mainUi.addView(progress, new LinearLayout.LayoutParams(MATCH, dp(3)));
         mainUi.addView(status, new LinearLayout.LayoutParams(MATCH, WRAP));
         mainUi.addView(content, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+        mainUi.addView(bottom, new LinearLayout.LayoutParams(MATCH, WRAP));
 
         fullscreen = new FrameLayout(this);
         fullscreen.setBackgroundColor(Color.BLACK);
@@ -261,13 +277,44 @@ public class MainActivity extends Activity {
         root.addView(mainUi, new FrameLayout.LayoutParams(MATCH, MATCH));
         root.addView(fullscreen, new FrameLayout.LayoutParams(MATCH, MATCH));
         setContentView(root);
-        updateBtn();
+        updateButtons();
     }
 
-    private void updateBtn() {
-        int n = found.size();
-        grabBtn.setText("🎬 " + n);
-        grabBtn.setBackgroundColor(n > 0 ? 0xFFD32F2F : 0xFF616161);
+    private List<VideoItem> pendingVideos() {
+        List<VideoItem> out = new ArrayList<>();
+        for (VideoItem it : found.values()) {
+            if (!doneKeys.contains(it.key())) out.add(it);
+        }
+        return out;
+    }
+
+    private List<String> pendingPages() {
+        List<String> out = new ArrayList<>();
+        for (String p : pages) {
+            if (!donePages.contains(p)) out.add(p);
+        }
+        return out;
+    }
+
+    private void updateButtons() {
+        int v = pendingVideos().size();
+        int p = pendingPages().size();
+        if (scanner != null) {
+            allBtn.setText("⏳ Sedang memeriksa halaman…");
+            allBtn.setBackgroundColor(0xFF616161);
+        } else if (v == 0 && p == 0) {
+            allBtn.setText("⬇ UNDUH SEMUA  (mencari video…)");
+            allBtn.setBackgroundColor(0xFF616161);
+        } else {
+            StringBuilder sb = new StringBuilder("⬇ UNDUH SEMUA  (");
+            if (v > 0) sb.append(v).append(" video");
+            if (v > 0 && p > 0) sb.append(" + ");
+            if (p > 0) sb.append(p).append(" halaman");
+            sb.append(")");
+            allBtn.setText(sb.toString());
+            allBtn.setBackgroundColor(0xFFD32F2F);
+        }
+        listBtn.setText("📋 " + found.size());
     }
 
     private void toast(String msg) {
@@ -278,7 +325,7 @@ public class MainActivity extends Activity {
         status.setText(msg);
         status.setVisibility(View.VISIBLE);
         ui.removeCallbacks(hideStatus);
-        if (finished) ui.postDelayed(hideStatus, 8000);
+        if (finished) ui.postDelayed(hideStatus, 10000);
     }
 
     private void hideKeyboard() {
@@ -290,68 +337,21 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ WebView
 
     private void setupWebView() {
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
-        s.setBuiltInZoomControls(true);
-        s.setDisplayZoomControls(false);
-        s.setSupportMultipleWindows(false);           // link target=_blank dibuka di tab yang sama
-        s.setJavaScriptCanOpenWindowsAutomatically(false); // blok popup iklan
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
-        // Hapus penanda "; wv" supaya situs tidak memblokir WebView
-        userAgent = s.getUserAgentString().replace("; wv", "");
-        s.setUserAgentString(userAgent);
+        userAgent = WebSetup.configure(web, mainSink);
 
-        CookieManager cm = CookieManager.getInstance();
-        cm.setAcceptCookie(true);
-        cm.setAcceptThirdPartyCookies(web, true);
-
-        web.addJavascriptInterface(new Bridge(), "VidGrab");
-
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                String scheme = request.getUrl().getScheme();
-                if (scheme == null) return true;
-                scheme = scheme.toLowerCase(Locale.ROOT);
-                // Hanya izinkan http/https; intent://, market:// dll. (biasanya iklan) diblok
-                return !(scheme.equals("http") || scheme.equals("https") || scheme.equals("about"));
-            }
-
+        web.setWebViewClient(new WebSetup.SniffClient(mainSink) {
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                pageUrl = url;
+                onNavigate(url);
                 if (!urlBar.hasFocus()) urlBar.setText(url);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 pageUrl = url;
-                pageTitle = view.getTitle() == null ? "" : view.getTitle();
+                if (view.getTitle() != null) pageTitle = view.getTitle();
                 if (!urlBar.hasFocus()) urlBar.setText(url);
                 scanNow();
-            }
-
-            @Override
-            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                // Dipanggil di background thread untuk SETIAP request (termasuk dari iframe player)
-                final String u = request.getUrl().toString();
-                final String t = classify(u, null);
-                if (t != null) {
-                    String ref = null;
-                    Map<String, String> h = request.getRequestHeaders();
-                    if (h != null) {
-                        ref = h.get("Referer");
-                        if (ref == null) ref = h.get("referer");
-                    }
-                    final String referer = ref != null ? ref : pageUrl;
-                    ui.post(() -> addFound(u, t, referer));
-                }
-                return null; // tetap biarkan WebView memuatnya seperti biasa
             }
         });
 
@@ -387,20 +387,40 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Situs yang memicu "download" langsung (tombol Download di file hosting)
+        // Tombol "Download" milik situs (file hosting) → langsung unduh kalau itu video
         web.setDownloadListener((url, ua, contentDisposition, mimetype, contentLength) -> {
-            String t = classify(url, mimetype);
+            String name = URLUtil.guessFileName(url, contentDisposition, mimetype);
+            String t = Sniffer.classify(url, mimetype);
+            if (t == null && Sniffer.looksLikeVideoName(name)) t = "video";
             final VideoItem it = new VideoItem(url, t != null ? t : "file", pageUrl);
-            it.name = URLUtil.guessFileName(url, contentDisposition, mimetype);
-            if (t != null) addFound(url, t, pageUrl);
-            String size = contentLength > 0 ? String.format(Locale.US, "\nUkuran: %.1f MB", contentLength / 1048576.0) : "";
-            new AlertDialog.Builder(this)
-                    .setTitle("Unduh file?")
-                    .setMessage(it.name + size)
-                    .setPositiveButton("Unduh", (d, w) -> startDownload(it))
-                    .setNegativeButton("Batal", null)
-                    .show();
+            it.name = name;
+            if (t != null) {
+                addFound(it);
+                downloadSingle(it);
+            } else {
+                String size = contentLength > 0
+                        ? String.format(Locale.US, "\nUkuran: %.1f MB", contentLength / 1048576.0) : "";
+                new AlertDialog.Builder(this)
+                        .setTitle("Unduh file ini?")
+                        .setMessage(name + size)
+                        .setPositiveButton("Unduh", (d, w) -> downloadSingle(it))
+                        .setNegativeButton("Batal", null)
+                        .show();
+            }
         });
+    }
+
+    /** Halaman baru → daftar video direset (yang sudah diunduh tetap diingat). */
+    private void onNavigate(String url) {
+        if (!Sniffer.stripFragment(url).equals(Sniffer.stripFragment(pageUrl))) {
+            found.clear();
+            pages.clear();
+            toastShown = false;
+            String t = Sniffer.classify(url, null);
+            if (t != null) found.put(Sniffer.keyFor(url), new VideoItem(url, t, url));
+            updateButtons();
+        }
+        pageUrl = url;
     }
 
     private void hideCustomView() {
@@ -414,80 +434,26 @@ public class MainActivity extends Activity {
     }
 
     private void scanNow() {
-        if (web != null) web.evaluateJavascript(SCAN_JS, null);
+        if (web != null) web.evaluateJavascript(Sniffer.SCAN_JS, null);
     }
 
-    /** Dipanggil dari JavaScript halaman. */
-    class Bridge {
-        @JavascriptInterface
-        public void report(String json) {
-            try {
-                JSONArray a = new JSONArray(json);
-                for (int i = 0; i < a.length(); i++) {
-                    String s = a.optString(i, "");
-                    if (s.length() < 4) continue;
-                    boolean fromVideoTag = s.startsWith("V|");
-                    String u = s.substring(2);
-                    String t = classify(u, null);
-                    if (t == null && fromVideoTag && (u.startsWith("http://") || u.startsWith("https://"))) {
-                        t = "video"; // sumber <video> tanpa ekstensi, mis. /stream?id=123
-                    }
-                    if (t != null) {
-                        final String tt = t;
-                        final String ref = pageUrl;
-                        ui.post(() -> addFound(u, tt, ref));
-                    }
-                }
-            } catch (Exception ignored) {
-            }
+    private void addFound(VideoItem it) {
+        String key = it.key();
+        if (found.containsKey(key) || found.size() >= 300) return;
+        found.put(key, it);
+        updateButtons();
+        if (!toastShown) {
+            toastShown = true;
+            toast("Video terdeteksi! Tekan ⬇ UNDUH SEMUA");
         }
     }
 
-    // ------------------------------------------------------------------ deteksi
-
-    /** Kembalikan jenis video ("mp4", "m3u8", ...) atau null kalau bukan video. */
-    static String classify(String url, String mime) {
-        if (url == null) return null;
-        String low = url.toLowerCase(Locale.ROOT);
-        if (!(low.startsWith("http://") || low.startsWith("https://"))) return null;
-
-        if (mime != null) {
-            String m = mime.toLowerCase(Locale.ROOT);
-            if (m.contains("mpegurl")) return "m3u8";
-            if (m.contains("dash+xml")) return "mpd";
-            if (m.startsWith("video/")) {
-                String e = m.substring(6);
-                int sc = e.indexOf(';');
-                if (sc >= 0) e = e.substring(0, sc);
-                e = e.trim();
-                if (e.equals("mp2t")) return null; // potongan segmen .ts
-                if (e.equals("quicktime")) return "mov";
-                if (e.equals("x-matroska")) return "mkv";
-                if (e.equals("3gpp")) return "3gp";
-                if (e.equals("x-flv")) return "flv";
-                return e.isEmpty() ? "video" : e;
-            }
-        }
-
-        String path = low;
-        int q = path.indexOf('?');
-        if (q >= 0) path = path.substring(0, q);
-        int h = path.indexOf('#');
-        if (h >= 0) path = path.substring(0, h);
-
-        if (path.endsWith(".m3u8")) return "m3u8";
-        if (path.endsWith(".mpd")) return "mpd";
-        for (String e : VIDEO_EXT) {
-            if (path.endsWith(e)) return e.substring(1);
-        }
-        return null;
-    }
-
-    private void addFound(String url, String type, String referer) {
-        if (found.containsKey(url) || found.size() >= 300) return;
-        found.put(url, new VideoItem(url, type, referer));
-        updateBtn();
-        if (found.size() == 1) toast("Video terdeteksi! Tekan tombol 🎬 untuk unduh");
+    private void addPage(String url) {
+        String u = Sniffer.stripFragment(url);
+        if (u.equals(Sniffer.stripFragment(pageUrl)) || pages.contains(u) || pages.size() >= 100) return;
+        if (found.containsKey(Sniffer.keyFor(u))) return;
+        pages.add(u);
+        updateButtons();
     }
 
     // ------------------------------------------------------------------ navigasi
@@ -508,8 +474,6 @@ public class MainActivity extends Activity {
     }
 
     private void loadUrl(String url) {
-        found.clear();
-        updateBtn();
         urlBar.setText(url);
         web.loadUrl(url);
     }
@@ -530,24 +494,123 @@ public class MainActivity extends Activity {
         return null;
     }
 
-    // ------------------------------------------------------------------ daftar & unduh
+    // ------------------------------------------------------------------ unduh
 
-    private static String shortLabel(VideoItem it) {
+    private String titleBase() {
+        String t = Dl.sanitize(pageTitle);
+        if (t.isEmpty()) t = "video";
+        return t + "_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+    }
+
+    /** SATU TOMBOL: unduh semua video yang terdeteksi + cek halaman yang berisi video. */
+    private void downloadAll(boolean afterTrigger) {
+        if (needsStoragePermission()) {
+            afterPermission = () -> downloadAll(afterTrigger);
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
+            return;
+        }
+        if (scanner != null) {
+            toast("Sedang memeriksa halaman, tunggu sebentar…");
+            return;
+        }
+        final List<VideoItem> vids = pendingVideos();
+        List<String> pgs = pendingPages();
+
+        if (vids.isEmpty() && pgs.isEmpty()) {
+            if (afterTrigger) {
+                status.setVisibility(View.GONE);
+                new AlertDialog.Builder(this)
+                        .setTitle("Belum ada video")
+                        .setMessage("Video belum terdeteksi di halaman ini.\n\n"
+                                + "• Coba tekan PLAY di videonya, tunggu beberapa detik, lalu tekan UNDUH SEMUA lagi.\n"
+                                + "• Di file hosting, coba tekan tombol Download milik situsnya.\n"
+                                + "• Video ber-DRM (Netflix dll.) memang tidak bisa diunduh.")
+                        .setPositiveButton("OK", null)
+                        .show();
+                return;
+            }
+            // Pancing player agar link videonya termuat, lalu coba lagi
+            showStatus("Mencari video… memancing player agar videonya termuat", false);
+            web.evaluateJavascript(Sniffer.TRIGGER_JS, null);
+            ui.postDelayed(() -> {
+                scanNow();
+                ui.postDelayed(() -> downloadAll(true), 1500);
+            }, 6000);
+            return;
+        }
+
+        for (VideoItem it : vids) doneKeys.add(it.key());
+        final String base = titleBase();
+
+        if (pgs.isEmpty()) {
+            runBatch(vids, base, true);
+            return;
+        }
+
+        if (pgs.size() > MAX_PAGES) pgs = new ArrayList<>(pgs.subList(0, MAX_PAGES));
+        donePages.addAll(pgs);
+        scanner = new DeepScanner(this, content, pgs, new DeepScanner.Callback() {
+            @Override
+            public void onProgress(String message) {
+                showStatus(message, false);
+            }
+
+            @Override
+            public void onDone(List<VideoItem> list) {
+                scanner = null;
+                List<VideoItem> all = new ArrayList<>(vids);
+                for (VideoItem it : list) {
+                    if (doneKeys.add(it.key())) all.add(it);
+                }
+                updateButtons();
+                if (all.isEmpty()) {
+                    showStatus("Tidak ada video yang bisa diambil dari halaman-halaman tersebut.", true);
+                } else {
+                    runBatch(all, base, true);
+                }
+            }
+        });
+        updateButtons();
+        scanner.start();
+        updateButtons();
+    }
+
+    private void downloadSingle(VideoItem it) {
+        if (needsStoragePermission()) {
+            afterPermission = () -> downloadSingle(it);
+            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
+            return;
+        }
+        doneKeys.add(it.key());
+        runBatch(Collections.singletonList(it), titleBase(), false);
+    }
+
+    private void runBatch(List<VideoItem> items, String base, boolean filterSmall) {
+        showStatus("Memulai unduhan " + items.size() + " video…", false);
+        updateButtons();
+        worker.execute(new BatchDownloader(getApplicationContext(), new ArrayList<>(items), userAgent, base,
+                filterSmall, (msg, fin) -> ui.post(() -> showStatus(msg, fin))));
+    }
+
+    // ------------------------------------------------------------------ daftar (unduh satu-satu)
+
+    private static String shortLabel(VideoItem it, boolean done) {
         Uri u = Uri.parse(it.url);
         String seg = u.getLastPathSegment();
         if (seg == null || seg.isEmpty()) seg = "(tanpa nama)";
         if (seg.length() > 40) seg = seg.substring(0, 37) + "...";
         String host = u.getHost() == null ? "" : u.getHost();
-        return "[" + it.type.toUpperCase(Locale.ROOT) + "] " + seg + "\n" + host;
+        return (done ? "✓ " : "") + "[" + it.type.toUpperCase(Locale.ROOT) + "] " + seg + "\n" + host;
     }
 
     private void showFoundList() {
         if (found.isEmpty()) {
+            int p = pendingPages().size();
             new AlertDialog.Builder(this)
-                    .setTitle("Belum ada video")
-                    .setMessage("Tekan PLAY pada videonya dulu, tunggu beberapa detik, lalu tekan tombol ini lagi.\n\n"
-                            + "Banyak situs (termasuk file hosting) baru memuat link video asli setelah video diputar "
-                            + "atau setelah kamu menekan tombol Download di halamannya.")
+                    .setTitle("Belum ada video langsung")
+                    .setMessage(p > 0
+                            ? "Ada " + p + " halaman berisi video. Tekan ⬇ UNDUH SEMUA untuk memeriksa & mengunduhnya."
+                            : "Tekan ⬇ UNDUH SEMUA — aplikasi akan mencoba memancing player supaya videonya terdeteksi.")
                     .setPositiveButton("OK", null)
                     .show();
             return;
@@ -555,14 +618,16 @@ public class MainActivity extends Activity {
         final List<VideoItem> items = new ArrayList<>(found.values());
         Collections.reverse(items); // yang terbaru di atas
         String[] labels = new String[items.size()];
-        for (int i = 0; i < items.size(); i++) labels[i] = shortLabel(items.get(i));
-
+        for (int i = 0; i < items.size(); i++) {
+            labels[i] = shortLabel(items.get(i), doneKeys.contains(items.get(i).key()));
+        }
         new AlertDialog.Builder(this)
-                .setTitle("Video ditemukan (" + items.size() + ")")
+                .setTitle("Video ditemukan (" + items.size() + ") — pilih satu")
                 .setItems(labels, (d, which) -> confirmItem(items.get(which)))
                 .setNeutralButton("Bersihkan", (d, w) -> {
                     found.clear();
-                    updateBtn();
+                    pages.clear();
+                    updateButtons();
                 })
                 .setNegativeButton("Tutup", null)
                 .show();
@@ -570,12 +635,12 @@ public class MainActivity extends Activity {
 
     private void confirmItem(VideoItem it) {
         String note = "";
-        if ("m3u8".equals(it.type)) note = "\n\nFormat streaming HLS: akan digabung jadi 1 file (.ts / .mp4). Biarkan aplikasi terbuka sampai selesai.";
+        if ("m3u8".equals(it.type)) note = "\n\nFormat HLS: potongan video akan digabung jadi 1 file.";
         if ("mpd".equals(it.type)) note = "\n\nFormat DASH (.mpd) belum didukung.";
         new AlertDialog.Builder(this)
                 .setTitle("Unduh video ini?")
                 .setMessage(it.url + note)
-                .setPositiveButton("Unduh", (d, w) -> startDownload(it))
+                .setPositiveButton("Unduh", (d, w) -> downloadSingle(it))
                 .setNeutralButton("Salin link", (d, w) -> {
                     ClipboardManager cb = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                     if (cb != null) cb.setPrimaryClip(ClipData.newPlainText("video", it.url));
@@ -583,79 +648,5 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton("Batal", null)
                 .show();
-    }
-
-    private static String sanitize(String s) {
-        if (s == null) return "";
-        s = s.replaceAll("[\\\\/:*?\"<>|\\n\\r\\t]", "_").trim();
-        if (s.length() > 80) s = s.substring(0, 80).trim();
-        return s;
-    }
-
-    private String titleBaseName() {
-        String t = sanitize(pageTitle);
-        if (t.isEmpty()) t = "video";
-        return t + "_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-    }
-
-    private String fileNameFor(VideoItem it) {
-        String name = it.name;
-        if (name == null || name.isEmpty()) name = URLUtil.guessFileName(it.url, null, null);
-        name = sanitize(name);
-        boolean isVideoType = !"file".equals(it.type);
-        if (isVideoType) {
-            String low = name.toLowerCase(Locale.ROOT);
-            boolean hasVideoExt = false;
-            for (String e : VIDEO_EXT) if (low.endsWith(e)) hasVideoExt = true;
-            if (!hasVideoExt) {
-                if (low.endsWith(".bin")) name = name.substring(0, name.length() - 4);
-                String ext = "video".equals(it.type) ? "mp4" : it.type;
-                if (ext.length() > 5) ext = "mp4";
-                // nama generik seperti "downloadfile" diganti judul halaman
-                if (name.isEmpty() || name.toLowerCase(Locale.ROOT).startsWith("downloadfile")) name = titleBaseName();
-                name = name + "." + ext;
-            }
-        }
-        if (name.isEmpty()) name = titleBaseName() + ".mp4";
-        return name;
-    }
-
-    private void startDownload(VideoItem it) {
-        if (Build.VERSION.SDK_INT < 29
-                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            pendingDownload = it;
-            requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
-            return;
-        }
-        if ("mpd".equals(it.type)) {
-            toast("Format DASH (.mpd) belum didukung. Coba cari link MP4/M3U8 lain di daftar.");
-            return;
-        }
-
-        if ("m3u8".equals(it.type)) {
-            showStatus("Menyiapkan unduhan HLS...", false);
-            new Thread(new HlsDownloader(getApplicationContext(), it.url, it.referer, userAgent,
-                    titleBaseName(), (msg, finished) -> ui.post(() -> showStatus(msg, finished))),
-                    "hls-download").start();
-            return;
-        }
-
-        String name = fileNameFor(it);
-        try {
-            DownloadManager.Request r = new DownloadManager.Request(Uri.parse(it.url));
-            String cookie = CookieManager.getInstance().getCookie(it.url);
-            if (cookie != null) r.addRequestHeader("Cookie", cookie);
-            r.addRequestHeader("User-Agent", userAgent);
-            if (it.referer != null && !it.referer.isEmpty()) r.addRequestHeader("Referer", it.referer);
-            r.setTitle(name);
-            r.setDescription("VidGrab");
-            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "VidGrab/" + name);
-            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
-            dm.enqueue(r);
-            toast("Mengunduh: " + name + "\nLihat progres di notifikasi. Hasil: folder Download/VidGrab");
-        } catch (Exception e) {
-            toast("Gagal mulai unduh: " + e.getMessage());
-        }
     }
 }

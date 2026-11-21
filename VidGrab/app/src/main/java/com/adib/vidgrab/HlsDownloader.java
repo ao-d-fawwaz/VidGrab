@@ -7,16 +7,12 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
-import android.webkit.CookieManager;
 
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -57,6 +53,7 @@ public class HlsDownloader implements Runnable {
     private final String baseName;
     private final Listener listener;
     private final Map<String, byte[]> keyCache = new HashMap<>();
+    volatile boolean success;
 
     public HlsDownloader(Context ctx, String playlistUrl, String referer, String userAgent,
                          String baseName, Listener listener) {
@@ -76,7 +73,7 @@ public class HlsDownloader implements Runnable {
         try {
             listener.onProgress("Membaca playlist...", false);
             String mediaUrl = playlistUrl;
-            String text = new String(fetchBytes(mediaUrl), StandardCharsets.UTF_8);
+            String text = new String(Net.fetchWithRetry(mediaUrl, referer, userAgent, 2), StandardCharsets.UTF_8);
             boolean separateAudio = false;
 
             // Playlist master → pilih varian dengan bandwidth tertinggi
@@ -85,7 +82,7 @@ public class HlsDownloader implements Runnable {
                 String best = pickBestVariant(text, mediaUrl);
                 if (best == null) throw new IOException("playlist master tanpa varian");
                 mediaUrl = best;
-                text = new String(fetchBytes(mediaUrl), StandardCharsets.UTF_8);
+                text = new String(Net.fetchWithRetry(mediaUrl, referer, userAgent, 2), StandardCharsets.UTF_8);
             }
             if (!text.contains("#EXTINF")) throw new IOException("bukan playlist video HLS yang valid");
 
@@ -179,6 +176,7 @@ public class HlsDownloader implements Runnable {
             }
             String msg = "Selesai ✔ Download/VidGrab/" + name;
             if (separateAudio) msg += "\n(Peringatan: situs ini memisah audio, hasil mungkin tanpa suara)";
+            success = true;
             listener.onProgress(msg, true);
         } catch (Exception e) {
             if (out != null) {
@@ -266,51 +264,6 @@ public class HlsDownloader implements Runnable {
     }
 
     private byte[] fetchWithRetry(String url) throws IOException {
-        IOException last = null;
-        for (int attempt = 1; attempt <= 3; attempt++) {
-            try {
-                return fetchBytes(url);
-            } catch (IOException e) {
-                last = e;
-                try {
-                    Thread.sleep(1000L * attempt);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("dibatalkan");
-                }
-            }
-        }
-        throw last;
-    }
-
-    private byte[] fetchBytes(String url) throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        try {
-            c.setConnectTimeout(20000);
-            c.setReadTimeout(30000);
-            c.setInstanceFollowRedirects(true);
-            if (userAgent != null) c.setRequestProperty("User-Agent", userAgent);
-            if (referer != null && !referer.isEmpty()) {
-                c.setRequestProperty("Referer", referer);
-                Uri r = Uri.parse(referer);
-                if (r.getScheme() != null && r.getHost() != null) {
-                    c.setRequestProperty("Origin", r.getScheme() + "://" + r.getHost());
-                }
-            }
-            String cookie = CookieManager.getInstance().getCookie(url);
-            if (cookie != null) c.setRequestProperty("Cookie", cookie);
-
-            int code = c.getResponseCode();
-            if (code >= 400) throw new IOException("server menolak (HTTP " + code + ")");
-            try (InputStream in = c.getInputStream()) {
-                ByteArrayOutputStream bo = new ByteArrayOutputStream();
-                byte[] buf = new byte[32768];
-                int n;
-                while ((n = in.read(buf)) != -1) bo.write(buf, 0, n);
-                return bo.toByteArray();
-            }
-        } finally {
-            c.disconnect();
-        }
+        return Net.fetchWithRetry(url, referer, userAgent, 3);
     }
 }
